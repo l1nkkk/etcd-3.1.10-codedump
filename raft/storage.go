@@ -233,7 +233,7 @@ func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte)
 // Compact discards all log entries prior to compactIndex.
 // It is the application's responsibility to not attempt to compact an index
 // greater than raftLog.applied.
-// 数据压缩，将compactIndex之前的数据丢弃掉
+// 数据压缩，将compactIndex之前的entries丢弃掉
 func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -281,7 +281,7 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 	}
 
 	// truncate compacted entries
-	// 2. 如果当前已经包含传入数据中的一部分，那么已经有的那部分数据可以不用重复添加进来，对 传入的entries 进行修剪
+	// 2. 如果传入的entries 中，有一部分在 Storage.snapshot 中，将其截断
 	if first > entries[0].Index {
 		entries = entries[first-entries[0].Index:]
 	}
