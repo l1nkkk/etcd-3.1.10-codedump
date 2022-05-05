@@ -16,7 +16,7 @@ package raft
 
 import "fmt"
 
-// ProgressStateProbe 用于检查该节点的网络情况，只有在应答leader的app msg 之后，才会从probe切换到replicate状态
+
 // 在probe状态下，leader每次心跳间隔只能向这个节点发送一条app信息，在应答这条app信息之前，不能向这个节点继续发送其他app信息。
 // 在网络不可用，或者follower拒绝了某条app信息之后，都会切换到这个状态
 // 这个状态也是节点的初始状态
@@ -135,7 +135,8 @@ func (pr *Progress) becomeSnapshot(snapshoti uint64) {
 
 // maybeUpdate returns false if the given n index comes from an outdated message.
 // Otherwise it updates the progress and returns true.
-// 如果传入的 n 小于等于当前的match索引，则索引就不会更新，返回false；否则更新索引返回true
+// maybeUpdate  用于更新 Match 和 Next，如果 n 大于 Process 中的 Match 和 Next，则更新；
+// 如果 Match 被更新，则返回True，并将 Pause 设置为 false; 如果返回fasle，表明传入的 n(m.Index) 是过期的
 func (pr *Progress) maybeUpdate(n uint64) bool {
 	var updated bool
 	if pr.Match < n {
@@ -153,39 +154,36 @@ func (pr *Progress) optimisticUpdate(n uint64) { pr.Next = n + 1 }
 
 // maybeDecrTo returns false if the given to index comes from an out of order message.
 // Otherwise it decreases the progress next index to min(rejected, last) and returns true.
-// maybeDecrTo函数在传入的索引不在范围内的情况下返回false
-// 否则将把该节点的index减少到min(rejected,last)然后返回true
-// rejected是被拒绝的append消息的索引，last是拒绝该消息的节点的最后一条日志索引
+// maybeDecrTo 用于缩小Process的Next 值，如果收到的 rejected 是过期的，直接返回 false；
+// rejected 表示被拒绝 msgApp 的Index，last 表示拒绝 msgApp 的节点的 lastIndex(this is a hint);
 func (pr *Progress) maybeDecrTo(rejected, last uint64) bool {
+
+	// 1. 如果该节点的Process处于ProgressStateReplicate状态，特点：pr.Next = pr.Match + 1
 	if pr.State == ProgressStateReplicate {
 		// the rejection must be stale if the progress has matched and "rejected"
 		// is smaller than "match".
-		if rejected <= pr.Match {
-			// 这种情况说明返回的情况已经过期，中间有其他添加成功的情况，导致match索引递增，
-			// 此时不需要回退索引，返回false
+		if rejected <= pr.Match {// pr.Next = pr.Match + 1，所以可以用 pr.Match 来判断
+			// 1-1. 收到的 rejected 已经过期，因为 match 的增加只有在对方成功接收后才增加
 			return false
 		}
-		// directly decrease next to match + 1
-		// 否则直接修改next到match+1
+		// 1-2. directly set next to match + 1，感觉略显多余
 		pr.Next = pr.Match + 1
 		return true
 	}
 
-	// 以下都不是接收副本状态的情况
+	// 2. 如果节点的Process不处于ProgressStateReplicate状态
 
 	// the rejection must be stale if "rejected" does not match next - 1
-	// 为什么这里不是对比Match？因为Next涉及到下一次给该Follower发送什么日志，
-	// 所以这里对比和下面修改的是Next索引
-	// Match只表示该节点上存放的最大日志索引，而当leader发生变化时，可能会覆盖一些日志
-	if pr.Next-1 != rejected {
-		// 这种情况说明返回的情况已经过期，不需要回退索引，返回false
+	// 2-1. 收到的 rejected 已经过期，return false
+	if pr.Next-1 != rejected { // 注意：与 rejected 判断的是 pr.Next-1，而不是 pr.Match
 		return false
 	}
 
-	// 到了这里就回退Next为两者的较小值
+	// 2-2. pr.Next = min(pr.Next-1, last+1)
 	if pr.Next = min(rejected, last+1); pr.Next < 1 {
 		pr.Next = 1
 	}
+	// 2-3. Pause set false
 	pr.resume()
 	return true
 }
@@ -197,23 +195,17 @@ func (pr *Progress) resume() { pr.Paused = false }
 // paused. A node may be paused because it has rejected recent
 // MsgApps, is currently waiting for a snapshot, or has reached the
 // MaxInflightMsgs limit.
-// 一个节点当前处于暂停状态原因有几个：
-// 1)拒绝了最近的append消息(ProgressStateProbe状态)
-// 2)接受snapshot状态中(ProgressStateSnapshot状态)
-// 3)已经达到了需要限流的程度(ProgressStateReplicate状态且滑动窗口已满)
-// ispause在以下情况中返回true：
-// 1）等待接收快照
-// 2) inflight数组已满，需要进行限流
-// 3) 进入ProgressStateProbe状态，这种状态说明最近拒绝了msgapps消息
+// IsPaused 判断是否需要对该节点停止发送 entries，如果需要返回 true
 func (pr *Progress) IsPaused() bool {
 	switch pr.State {
 	case ProgressStateProbe:
+		// 1. 处于 ProgressStateProbe 状态，并且 pr.Paused 为 true
 		return pr.Paused
 	case ProgressStateReplicate:
-		// 如果在replicate状态，pause与否取决于infilght数组是否满了
+		// 2. 滑动窗口已满：处于 ProgressStateReplicate 状态，并且 pr.ins.full() 为true
 		return pr.ins.full()
 	case ProgressStateSnapshot:
-		// 处理快照时一定是paused的
+		// 3. 正在发送snapshot：处于ProgressStateSnapshot 状态
 		return true
 	default:
 		panic("unexpected state")

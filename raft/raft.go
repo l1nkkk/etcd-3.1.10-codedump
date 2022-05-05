@@ -428,7 +428,6 @@ func (r *raft) sendAppend(to uint64) {
 		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 	} else {
 		// 4. send entries if successful to get term and entries
-
 		// 4-1. 构造 pb.MsgApp
 		m.Type = pb.MsgApp
 		m.Index = pr.Next - 1
@@ -903,8 +902,7 @@ func stepLeader(r *raft, m pb.Message) {
 	// These message types do not require any progress for m.From.
 	switch m.Type {
 	case pb.MsgBeat:
-		// 广播HB消息
-		r.bcastHeartbeat()
+		r.bcastHeartbeat() // 广播心跳包
 		return
 	case pb.MsgCheckQuorum:
 		// 检查集群可用性
@@ -916,40 +914,38 @@ func stepLeader(r *raft, m pb.Message) {
 		}
 		return
 	case pb.MsgProp:
-		// 不能提交空数据
+		// 1. check
+		// 1-1. entries 不能为空
 		if len(m.Entries) == 0 {
 			r.logger.Panicf("%x stepped empty MsgProp", r.id)
 		}
-		// 检查是否在集群中
+		// 1-2. (important)检查是否在集群中，这种情况出现在当前leader被移出配置，但是leader仍临时管理该集群的情况
 		if _, ok := r.prs[r.id]; !ok {
 			// If we are not currently a member of the range (i.e. this node
 			// was removed from the configuration while serving as leader),
 			// drop any new proposals.
-			// 这里检查本节点是否还在集群以内，如果已经不在集群中了，不处理该消息直接返回。
-			// 这种情况出现在本节点已经通过配置变化被移除出了集群的场景。
 			return
 		}
-		// 当前正在转换leader过程中，不能提交
+		// 1-3 当前是否在进行 leader 禅让，如果是，不能处理 propose
 		if r.leadTransferee != None {
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return
 		}
 
+		// 2. 遍历 entries，处理其中的 config entry
 		for i, e := range m.Entries {
 			if e.Type == pb.EntryConfChange {
 				if r.pendingConf {
-					// 如果当前为还没有处理的配置变化请求，则其他配置变化的数据暂时忽略
+					// 2-1. 如果当前有未 apply 的 config entry，则忽略该 entry
 					r.logger.Infof("propose conf %s ignored since pending unapplied configuration", e.String())
-					// 将这个数据置空
 					m.Entries[i] = pb.Entry{Type: pb.EntryNormal}
 				}
-				// 置位有还没有处理的配置变化数据
 				r.pendingConf = true
 			}
 		}
-		// 添加数据到log中
+		// 3. 将 entries app 到 raftLog
 		r.appendEntry(m.Entries...)
-		// 向集群其他节点广播append消息
+		// 4. 向集群其他节点广播 MsgApp
 		r.bcastAppend()
 		return
 	case pb.MsgReadIndex:
@@ -997,41 +993,46 @@ func stepLeader(r *raft, m pb.Message) {
 		return
 	}
 	switch m.Type {
-	case pb.MsgAppResp: // 对append消息的应答
-		// 置位该节点当前是活跃的
+	case pb.MsgAppResp:
+		// 1. set active for this node
 		pr.RecentActive = true
 
-		if m.Reject { // 如果拒绝了append消息，说明term、index不匹配
+		// 2. Reject 为true表明日志匹配不通过
+		if m.Reject {
 			r.logger.Debugf("%x received msgApp rejection(lastindex: %d) from %x for index %d",
 				r.id, m.RejectHint, m.From, m.Index)
-			// rejecthint带来的是拒绝该app请求的节点，其最大日志的索引
-			if pr.maybeDecrTo(m.Index, m.RejectHint) { // 尝试回退关于该节点的Match、Next索引
+
+			// rejecthint 为拒绝该 msgApp 的节点的 lastindex，Index 用于日志匹配，其也可以用于标识发送给该节点的 msg
+			// 2-1. 尝试下调该节点对应 Process 的 Next
+			if pr.maybeDecrTo(m.Index, m.RejectHint) {
 				r.logger.Debugf("%x decreased progress of %x to [%s]", r.id, m.From, pr)
 				if pr.State == ProgressStateReplicate {
+					// l1nkkk: 切换到 Probe 状态，即探测 Next 的状态
 					pr.becomeProbe()
 				}
-				// 再次发送append消息
+				// 2-2. 再次发送 msgApp
 				r.sendAppend(m.From)
 			}
-		} else { // 通过该append请求
+		} else {
+			// 3. 此时的 m.Index 可能是对应follower的commitIndex(当msgApp携带的entries中存在follower
+			// 已commit的数据)或者其lastIndex
 			oldPaused := pr.IsPaused()
-			if pr.maybeUpdate(m.Index) { // 如果该节点的索引发生了更新
+			if pr.maybeUpdate(m.Index) {
+				// 3-1 如果收到的 msg resp 不是过期的
 				switch {
 				case pr.State == ProgressStateProbe:
-					// 如果当前该节点在探测状态，切换到可以接收副本状态
+					// a. 当前为 ProgressStateProbe，则切换为 Replicate 状态
 					pr.becomeReplicate()
 				case pr.State == ProgressStateSnapshot && pr.needSnapshotAbort():
-					// 如果当前该接在在接受快照状态，而且已经快照数据同步完成了
+					// b. 当前为 ProgressStateSnapshot，则切换为 Probe 状态
 					r.logger.Debugf("%x snapshot aborted, resumed sending replication messages to %x [%s]", r.id, m.From, pr)
-					// 切换到探测状态
 					pr.becomeProbe()
 				case pr.State == ProgressStateReplicate:
-					// 如果当前该节点在接收副本状态，因为通过了该请求，所以滑动窗口可以释放在这之前的索引了
+					// c. 当前为 ProgressStateReplicate 状态，则释放窗口
 					pr.ins.freeTo(m.Index)
 				}
-
+				// 3-2 尝试 commit entry，如果成功，则广播发送 msgApp
 				if r.maybeCommit() {
-					// 如果可以commit日志，那么广播append消息
 					r.bcastAppend()
 				} else if oldPaused {
 					// update() reset the wait state on this node. If we had delayed sending
@@ -1040,15 +1041,15 @@ func stepLeader(r *raft, m pb.Message) {
 					r.sendAppend(m.From)
 				}
 				// Transfer leadership is in progress.
+				// 3-3 如果在leader禅让的过程中，并且被禅让节点的日志已经和当前leader一样新，则发送 MsgTimeoutNow
 				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
-					// 要迁移过去的新leader，其日志已经追上了旧的leader
 					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.From)
 					r.sendTimeoutNow(m.From)
 				}
 			}
 		}
 	case pb.MsgHeartbeatResp:
-		// 该节点当前处于活跃状态
+		// 1. set active for this node
 		pr.RecentActive = true
 		// 这里调用resume是因为当前可能处于probe状态，而这个状态在两个heartbeat消息的间隔期只能收一条同步日志消息，因此在收到HB消息时就停止pause标记
 		pr.resume()
@@ -1218,7 +1219,7 @@ func stepFollower(r *raft, m pb.Message) {
 	case pb.MsgApp:
 		// 收到leader的 MsgApp，重置超时计时
 		r.electionElapsed = 0
-		r.lead = m.From
+		r.lead = m.From		// 似乎略显多余
 		r.handleAppendEntries(m)
 	case pb.MsgHeartbeat:
 		// 收到leader的 MsgApp，重置超时计时
@@ -1274,7 +1275,7 @@ func stepFollower(r *raft, m pb.Message) {
 
 // handleAppendEntries 处理MsgApp，添加日志
 func (r *raft) handleAppendEntries(m pb.Message) {
-	// 1. 传入的消息索引是已经commit过，返回并告知当前 commitIndex
+	// 1. 传入的消息索引是已经commit过，通过 msg 的 Index 字段告知当前 commitIndex
 	if m.Index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
@@ -1283,13 +1284,13 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 
 	// 2. 尝试添加到 raftLog 中
 	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
-		// 2-1 添加成功，返回的index是添加成功之后的最大index
+		// 2-1 添加成功，通过 msg 的 Index 字段告知当前的 raftLog lastIndex
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 	} else {
-		// 添加失败
+		// 2-2 添加失败，将 msg 的 Index 字段设置为 m.Index，
+		// Reject 字段设置为true，RejectHint 字段设置为 lastIndex
 		r.logger.Debugf("%x [logterm: %d, index: %d] rejected msgApp [logterm: %d, index: %d] from %x",
 			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
-		// 添加失败的时候，返回的Index是传入过来的Index，RejectHint是该节点当前日志的最后索引
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})
 	}
 }
