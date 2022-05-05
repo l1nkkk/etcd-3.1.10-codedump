@@ -73,7 +73,7 @@ type Progress struct {
 	// this Progress will be paused. raft will not resend snapshot until the pending one
 	// is reported to be failed.
 	// 如果向该节点发送快照消息，PendingSnapshot用于保存快照消息的lastIndex，
-	// 当PendingSnapshot不为0时，该节点也被标记为暂停状态。
+	// 当PendingSnapshot不为0时，该节点也被标记为暂停状态（即IsPaused返回true，此时不能进行 entries 的同步）。
 	// raft只有在这个正在进行中的快照同步失败以后，才会重传快照消息
 	PendingSnapshot uint64
 
@@ -135,7 +135,7 @@ func (pr *Progress) becomeSnapshot(snapshoti uint64) {
 
 // maybeUpdate returns false if the given n index comes from an outdated message.
 // Otherwise it updates the progress and returns true.
-// maybeUpdate  用于更新 Match 和 Next，如果 n 大于 Process 中的 Match 和 Next，则更新；
+// maybeUpdate 用于更新 Match 和 Next，如果n和n+1分别大于 Process 中的 Match 和 Next，则更新；
 // 如果 Match 被更新，则返回True，并将 Pause 设置为 false; 如果返回fasle，表明传入的 n(m.Index) 是过期的
 func (pr *Progress) maybeUpdate(n uint64) bool {
 	var updated bool
@@ -216,7 +216,7 @@ func (pr *Progress) snapshotFailure() { pr.PendingSnapshot = 0 }
 
 // needSnapshotAbort returns true if snapshot progress's Match
 // is equal or higher than the pendingSnapshot.
-// 可以中断快照的情况：当前为接收快照，同时match已经大于等于快照索引
+// 可以中断快照的情况：当前为ProgressStateSnapshot状态，同时match已经大于等于快照索引
 // 因为match已经大于快照索引了，所以这部分快照数据可以不接收了，也就是可以被中断的快照操作
 // 因为在节点落后leader数据很多的情况下，可能leader会多次通过snapshot同步数据给节点，
 // 而当 pr.Match >= pr.PendingSnapshot的时候，说明通过快照来同步数据的流程完成了，这时可以进入正常的接收同步数据状态了。
