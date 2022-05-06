@@ -128,7 +128,7 @@ func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
 	return rc.wal.ReleaseLockTo(snap.Metadata.Index)
 }
 
-// 传入一个commited entries数组，返回其中需要进行apply操作的数据数组
+// entriesToApply 传入一个commited entries数组，返回其中需要进行apply操作的数据数组
 func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 	if len(ents) == 0 {
 		return
@@ -233,6 +233,7 @@ func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 }
 
 // replayWAL replays WAL entries into the raft instance.
+// replayWAL recover from snapshot and wal, return wal's log entries
 func (rc *raftNode) replayWAL() *wal.WAL {
 	log.Printf("replaying WAL of member %d", rc.id)
 	// 1. 加载 snapshot
@@ -245,17 +246,23 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 		log.Fatalf("raftexample: failed to read WAL (%v)", err)
 	}
 
-	// 2-1. 如果 snapshot == nil，则apply snapshot
+	// 3. 如果 snapshot != nil，则将其写入memoryStorage中
 	rc.raftStorage = raft.NewMemoryStorage()
 	if snapshot != nil {
 		rc.raftStorage.ApplySnapshot(*snapshot)
 	}
+
+	// 4. 根据从wal中读取到的数据，设置 HardState
 	rc.raftStorage.SetHardState(st)
 
+	// 5. 将log entries添加到memoryStorage中
 	// append to storage so raft starts at the right place in log
 	rc.raftStorage.Append(ents)
+
+	// 6. 通知replay已经结束 or 更新lastIndex；
 	// send nil once lastIndex is published so client knows commit channel is current
 	if len(ents) > 0 {
+		// l1nkkk: 不用给 commitC 生产数据，因为后面将把 wal return给调用者，赋值给成员变量
 		rc.lastIndex = ents[len(ents)-1].Index
 	} else {
 		rc.commitC <- nil
@@ -401,6 +408,7 @@ func (rc *raftNode) maybeTriggerSnapshot() {
 	rc.snapshotIndex = rc.appliedIndex
 }
 
+// serveChannels
 func (rc *raftNode) serveChannels() {
 	snap, err := rc.raftStorage.Snapshot()
 	if err != nil {
@@ -412,9 +420,11 @@ func (rc *raftNode) serveChannels() {
 
 	defer rc.wal.Close()
 
+	// 1. 定义循环定时器tick，100ms tick 一次
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	// 2. part1: 启动协程，消费 proposeC 和 confChangeC
 	// send proposals over raft
 	go func() {
 		var confChangeCount uint64 = 0
@@ -443,36 +453,49 @@ func (rc *raftNode) serveChannels() {
 		close(rc.stopc)
 	}()
 
+	// 3. part2: 处理 tick，处理 raft 发送过来的数据（通过Ready）
 	// event loop on raft state machine updates
 	for {
 		select {
 		case <-ticker.C:
+			// 3-1 处理tick
 			rc.node.Tick()
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
-			// 将HardState，entries写入持久化存储中
+			// 3.2 处理ready,先持久化，再同步
+			// 3-2-1 将HardState，entries写入wal
 			rc.wal.Save(rd.HardState, rd.Entries)
+			// 3-2-2 如果有snapshot，则将其持久化、写入内存映像以及将snapshot apply到kvstore
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				// 如果快照数据不为空，也需要保存快照数据到持久化存储中
 				rc.saveSnap(rd.Snapshot)
 				rc.raftStorage.ApplySnapshot(rd.Snapshot)
 				rc.publishSnapshot(rd.Snapshot)
 			}
+			// 3-2-3 将Entries追加到MemoryStorage中
 			rc.raftStorage.Append(rd.Entries)
+
+			// 3-2-4 通过transport模块将Messages中的消息分发给其它raft节点
 			rc.transport.Send(rd.Messages)
+
+			// 3-2-5 将 entries apply 到kvstore
 			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
 				rc.stop()
 				return
 			}
+
+			// 3-2-6 判断是否对wal进行compact，生成新的snapshot
 			rc.maybeTriggerSnapshot()
+
+			// 3-2-7 告知raft，Ready已处理
 			rc.node.Advance()
 
 		case err := <-rc.transport.ErrorC:
+			// 3.3 处理 transport error
 			rc.writeError(err)
 			return
-
 		case <-rc.stopc:
+			// 3.4 处理 stopc
 			rc.stop()
 			return
 		}
