@@ -51,23 +51,26 @@ type raftNode struct {
 	getSnapshot func() ([]byte, error)
 	lastIndex   uint64 // index of log at start
 
-	confState     raftpb.ConfState
+	confState     raftpb.ConfState // 集群配置状态
 	snapshotIndex uint64
-	appliedIndex  uint64
+	appliedIndex  uint64 // applied的最后一条日志的索引
 
 	// raft backing for the commit/error channel
-	node        raft.Node
+	// etcd/raft的核心接口，对于一个最简单的实现来说，开发者只需要与该接口打交道即可实现基于raft的服务
+	node raft.Node
+	// raftLog 的内存映射
 	raftStorage *raft.MemoryStorage
-	wal         *wal.WAL
+	// 	预写日志实现，raftexample直接使用了etcd/wal模块中的实现。
+	wal *wal.WAL
 
-	snapshotter      *snap.Snapshotter
+	snapshotter      *snap.Snapshotter      // 	快照管理器的指针
 	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
 
-	snapCount uint64
-	transport *rafthttp.Transport
-	stopc     chan struct{} // signals proposal channel closed
-	httpstopc chan struct{} // signals http server to shutdown
-	httpdonec chan struct{} // signals http server shutdown complete
+	snapCount uint64              // 当wal中的日志超过该值时，触发快照操作并压缩日志
+	transport *rafthttp.Transport // etcd/raft模块通信时使用的接口。同样，这里使用了基于http的默认实现
+	stopc     chan struct{}       // signals proposal channel closed
+	httpstopc chan struct{}       // signals http server to shutdown
+	httpdonec chan struct{}       // signals http server shutdown complete
 }
 
 var defaultSnapCount uint64 = 10000
@@ -80,9 +83,11 @@ var defaultSnapCount uint64 = 10000
 func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
 
+	// 1. 分配channel，谁生产数据，谁分配
 	commitC := make(chan *string)
 	errorC := make(chan error)
 
+	// 2. 构造raftNode
 	rc := &raftNode{
 		proposeC:    proposeC,
 		confChangeC: confChangeC,
@@ -99,10 +104,13 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 		httpstopc:   make(chan struct{}),
 		httpdonec:   make(chan struct{}),
 
-		snapshotterReady: make(chan *snap.Snapshotter, 1),
+		snapshotterReady: make(chan *snap.Snapshotter, 1),// 非阻塞
 		// rest of structure populated after WAL replay
 	}
+
+	// 3. 开启协程，启动raft模块
 	go rc.startRaft()
+	// 4. 返回channel，这些channel的生产者都是raft
 	return commitC, errorC, rc.snapshotterReady
 }
 
@@ -188,6 +196,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 	return true
 }
 
+// loadSnapshot 加载 snapshot
 func (rc *raftNode) loadSnapshot() *raftpb.Snapshot {
 	snapshot, err := rc.snapshotter.Load()
 	if err != nil && err != snap.ErrNoSnapshot {
@@ -226,12 +235,17 @@ func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 // replayWAL replays WAL entries into the raft instance.
 func (rc *raftNode) replayWAL() *wal.WAL {
 	log.Printf("replaying WAL of member %d", rc.id)
+	// 1. 加载 snapshot
 	snapshot := rc.loadSnapshot()
+
+	// 2. 打开并加载 log entries
 	w := rc.openWAL(snapshot)
 	_, st, ents, err := w.ReadAll()
 	if err != nil {
 		log.Fatalf("raftexample: failed to read WAL (%v)", err)
 	}
+
+	// 2-1. 如果 snapshot == nil，则apply snapshot
 	rc.raftStorage = raft.NewMemoryStorage()
 	if snapshot != nil {
 		rc.raftStorage.ApplySnapshot(*snapshot)
@@ -257,7 +271,9 @@ func (rc *raftNode) writeError(err error) {
 	rc.node.Stop()
 }
 
+// startRaft 启动raft服务
 func (rc *raftNode) startRaft() {
+	// 1. 根据 snapdir 初始化 snapshotter
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
 			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
@@ -265,7 +281,10 @@ func (rc *raftNode) startRaft() {
 	}
 	rc.snapshotter = snap.New(rc.snapdir)
 	rc.snapshotterReady <- rc.snapshotter
+	// TODO: maybe bug，kvstorage 中的 readCommits 并没有对 snapshotterReady 进行处理，
+	// TODO: 所以如果需要从已有的snapshot recover，会出问题
 
+	// 2. 根据 waldir 初始化 wal，并且进行 log replay
 	oldwal := wal.Exist(rc.waldir)
 	rc.wal = rc.replayWAL()
 
@@ -282,6 +301,7 @@ func (rc *raftNode) startRaft() {
 		MaxInflightMsgs: 256,
 	}
 
+	// 3. 获取 raft.node 对象
 	if oldwal {
 		rc.node = raft.RestartNode(c)
 	} else {
@@ -295,6 +315,7 @@ func (rc *raftNode) startRaft() {
 	ss := &stats.ServerStats{}
 	ss.Initialize()
 
+	// 4. 开启通信模块
 	rc.transport = &rafthttp.Transport{
 		ID:          types.ID(rc.id),
 		ClusterID:   0x1000,
@@ -310,7 +331,7 @@ func (rc *raftNode) startRaft() {
 			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
 		}
 	}
-
+	// 5. 启动两个协程，一个通过 transport 处理接收自其他节点的raft数据；一个用来处理raftNodex中的各种channel
 	go rc.serveRaft()
 	go rc.serveChannels()
 }

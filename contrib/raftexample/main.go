@@ -22,17 +22,20 @@ import (
 )
 
 func main() {
-	cluster := flag.String("cluster", "http://127.0.0.1:9021", "com	ma separated cluster peers")
+	// 1. 处理命令行参数
+	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
 	id := flag.Int("id", 1, "node ID")
 	kvport := flag.Int("port", 9121, "key-value server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 	flag.Parse()
 
+	// 2. 分配 proposeC 和 confChangeC 两个channel，消费者为raft
 	proposeC := make(chan string)
 	defer close(proposeC)
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
+	// 3. 初始化 kvstorage
 	// raft provides a commit stream for the proposals from the http api
 	var kvs *kvstore
 	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }

@@ -25,33 +25,33 @@ import (
 
 // Handler for a http based key-value store backed by raft
 type httpKVAPI struct {
-	store       *kvstore
-	confChangeC chan<- raftpb.ConfChange
+	store       *kvstore					// kv 存储模块
+	confChangeC chan<- raftpb.ConfChange	// 与 raft 交互的配置更新channel
 }
 
 func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := r.RequestURI
 	switch {
-	case r.Method == "PUT":
+	case r.Method == "PUT": // 1. 新增数据
 		v, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			log.Printf("Failed to read on PUT (%v)\n", err)
 			http.Error(w, "Failed on PUT", http.StatusBadRequest)
 			return
 		}
-
+		// l1nkkk: input key,val
 		h.store.Propose(key, string(v))
 
 		// Optimistic-- no waiting for ack from raft. Value is not yet
 		// committed so a subsequent GET on the key may return old value
 		w.WriteHeader(http.StatusNoContent)
-	case r.Method == "GET":
+	case r.Method == "GET": // 2. get data
 		if v, ok := h.store.Lookup(key); ok {
 			w.Write([]byte(v))
 		} else {
 			http.Error(w, "Failed to GET", http.StatusNotFound)
 		}
-	case r.Method == "POST":
+	case r.Method == "POST": // 3. add node
 		url, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			log.Printf("Failed to read on POST (%v)\n", err)
@@ -65,7 +65,7 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed on POST", http.StatusBadRequest)
 			return
 		}
-
+		// l1nkkk: 直接和raft打交道
 		cc := raftpb.ConfChange{
 			Type:    raftpb.ConfChangeAddNode,
 			NodeID:  nodeId,
@@ -75,14 +75,14 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// As above, optimistic that raft will apply the conf change
 		w.WriteHeader(http.StatusNoContent)
-	case r.Method == "DELETE":
+	case r.Method == "DELETE": // 4. drop node
 		nodeId, err := strconv.ParseUint(key[1:], 0, 64)
 		if err != nil {
 			log.Printf("Failed to convert ID for conf change (%v)\n", err)
 			http.Error(w, "Failed on DELETE", http.StatusBadRequest)
 			return
 		}
-
+		// l1nkkk: 直接和raft打交道
 		cc := raftpb.ConfChange{
 			Type:   raftpb.ConfChangeRemoveNode,
 			NodeID: nodeId,
