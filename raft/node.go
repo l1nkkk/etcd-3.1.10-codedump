@@ -182,7 +182,7 @@ type Node interface {
 	ReadIndex(ctx context.Context, rctx []byte) error
 
 	// Status returns the current status of the raft state machine.
-	// Status 返回当前状态机的状态
+	// Status 返回当前raft的状态
 	Status() Status
 
 	// ReportUnreachable reports the given node is not reachable for the last send.
